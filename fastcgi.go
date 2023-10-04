@@ -15,7 +15,6 @@
 package fastcgi
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -74,8 +73,8 @@ type Handler struct {
 	Logger *slog.Logger
 }
 
-// Provision sets up h.
-func (h *Handler) Provision(ctx context.Context) error {
+// RoundTrip implements http.RoundTripper.
+func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if h.Root == "" {
 		h.Root = "{http.vars.root}"
 	}
@@ -94,11 +93,6 @@ func (h *Handler) Provision(ctx context.Context) error {
 		h.DialTimeout = time.Duration(3 * time.Second)
 	}
 
-	return nil
-}
-
-// RoundTrip implements http.RoundTripper.
-func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Disallow null bytes in the request path, because
 	// PHP upstreams may do bad things, like execute a
 	// non-PHP file as PHP code. See #4574
