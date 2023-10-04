@@ -15,8 +15,10 @@
 package fastcgi
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,21 +26,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 var noopLogger = slog.Default()
 
-func init() {
-	caddy.RegisterModule(Transport{})
-}
-
-// Transport facilitates FastCGI communication.
-type Transport struct {
+// Handler facilitates FastCGI communication.
+type Handler struct {
 	// Use this directory as the fastcgi root directory. Defaults to the root
 	// directory of the parent virtual host.
 	Root string `json:"root,omitempty"`
@@ -65,13 +58,13 @@ type Transport struct {
 	EnvVars map[string]string `json:"env,omitempty"`
 
 	// The duration used to set a deadline when connecting to an upstream. Default: `3s`.
-	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
+	DialTimeout time.Duration `json:"dial_timeout,omitempty"`
 
 	// The duration used to set a deadline when reading from the FastCGI server.
-	ReadTimeout caddy.Duration `json:"read_timeout,omitempty"`
+	ReadTimeout time.Duration `json:"read_timeout,omitempty"`
 
 	// The duration used to set a deadline when sending to the FastCGI server.
-	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+	WriteTimeout time.Duration `json:"write_timeout,omitempty"`
 
 	// Capture and log any messages sent by the upstream on stderr. Logs at WARN
 	// level by default. If the response has a 4xx or 5xx status ERROR level will
@@ -82,81 +75,65 @@ type Transport struct {
 	logger         *slog.Logger
 }
 
-// CaddyModule returns the Caddy module information.
-func (Transport) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "http.reverse_proxy.transport.fastcgi",
-		New: func() caddy.Module { return new(Transport) },
-	}
-}
+// Provision sets up h.
+func (h *Handler) Provision(ctx context.Context) error {
+	h.logger = slog.Default()
 
-// Provision sets up t.
-func (t *Transport) Provision(ctx caddy.Context) error {
-	t.logger = slog.Default()
-
-	if t.Root == "" {
-		t.Root = "{http.vars.root}"
+	if h.Root == "" {
+		h.Root = "{http.vars.root}"
 	}
 
-	version, _ := caddy.Version()
-	t.serverSoftware = "Caddy/" + version
+	version := "0.1.0"
+	h.serverSoftware = "CaddyFastcgi/" + version
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
-	if t.DialTimeout == 0 {
-		t.DialTimeout = caddy.Duration(3 * time.Second)
+	if h.DialTimeout == 0 {
+		h.DialTimeout = time.Duration(3 * time.Second)
 	}
 
 	return nil
 }
 
 // RoundTrip implements http.RoundTripper.
-func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
-	server := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
-
+func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Disallow null bytes in the request path, because
 	// PHP upstreams may do bad things, like execute a
 	// non-PHP file as PHP code. See #4574
-	if strings.Contains(r.URL.Path, "\x00") {
-		return nil, caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid request path"))
+	if strings.Contains(req.URL.Path, "\x00") {
+		http.Error(rw, "invalid request path", http.StatusBadRequest)
+		return
 	}
 
-	env, err := t.buildEnv(r)
+	env, err := h.buildEnv(req)
 	if err != nil {
-		return nil, fmt.Errorf("building environment: %v", err)
+		http.Error(rw, fmt.Sprintf("building environment: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	ctx := r.Context()
+	ctx := req.Context()
 
 	// extract dial information from request (should have been embedded by the reverse proxy)
-	network, address := "tcp", r.URL.Host
-	if dialInfo, ok := reverseproxy.GetDialInfo(ctx); ok {
-		network = dialInfo.Network
-		address = dialInfo.Address
-	}
+	network, address := "tcp", req.URL.Host
 
-	logCreds := server.Logs != nil && server.Logs.ShouldLogCredentials
-	loggableReq := caddyhttp.LoggableHTTPRequest{
-		Request:              r,
-		ShouldLogCredentials: logCreds,
-	}
-	loggableEnv := loggableEnv{EnvVars: env, LogCredentials: logCreds}
+	loggableEnv := loggableEnv{EnvVars: env, LogCredentials: true}
 
-	logger := t.logger.With(
-		"request", loggableReq,
+	logger := h.logger.With(
+		"request", req,
 		"env", loggableEnv,
 	)
 	logger.Debug("roundtrip",
 		"dial", address,
 		"env", loggableEnv,
-		"request", loggableReq,
+		"request", req,
 	)
 
 	// connect to the backend
-	dialer := net.Dialer{Timeout: time.Duration(t.DialTimeout)}
+	dialer := net.Dialer{Timeout: time.Duration(h.DialTimeout)}
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
-		return nil, fmt.Errorf("dialing backend: %v", err)
+		http.Error(rw, fmt.Sprintf("dialing backend: %v", err), http.StatusBadGateway)
+		return
 	}
 	defer func() {
 		// conn will be closed with the response body unless there's an error
@@ -170,53 +147,64 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		rwc:    conn,
 		reqID:  1,
 		logger: logger,
-		stderr: t.CaptureStderr,
+		stderr: h.CaptureStderr,
 	}
 
 	// read/write timeouts
-	if err = client.SetReadTimeout(time.Duration(t.ReadTimeout)); err != nil {
-		return nil, fmt.Errorf("setting read timeout: %v", err)
+	if err = client.SetReadTimeout(time.Duration(h.ReadTimeout)); err != nil {
+		http.Error(rw, fmt.Sprintf("setting read timeout: %v", err), http.StatusBadGateway)
+		return
 	}
-	if err = client.SetWriteTimeout(time.Duration(t.WriteTimeout)); err != nil {
-		return nil, fmt.Errorf("setting write timeout: %v", err)
+	if err = client.SetWriteTimeout(time.Duration(h.WriteTimeout)); err != nil {
+		http.Error(rw, fmt.Sprintf("setting write timeout: %v", err), http.StatusBadGateway)
+		return
 	}
 
-	contentLength := r.ContentLength
+	contentLength := req.ContentLength
 	if contentLength == 0 {
-		contentLength, _ = strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
+		contentLength, _ = strconv.ParseInt(req.Header.Get("Content-Length"), 10, 64)
 	}
 
 	var resp *http.Response
-	switch r.Method {
+	switch req.Method {
 	case http.MethodHead:
 		resp, err = client.Head(env)
 	case http.MethodGet:
-		resp, err = client.Get(env, r.Body, contentLength)
+		resp, err = client.Get(env, req.Body, contentLength)
 	case http.MethodOptions:
 		resp, err = client.Options(env)
 	default:
-		resp, err = client.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
+		resp, err = client.Post(env, req.Method, req.Header.Get("Content-Type"), req.Body, contentLength)
 	}
 	if err != nil {
-		return nil, err
+		http.Error(rw, err.Error(), http.StatusBadGateway)
+		return
 	}
+	defer resp.Body.Close()
 
-	return resp, nil
+	for key, values := range resp.Header {
+		for _, value := range values {
+			rw.Header().Add(key, value)
+		}
+	}
+	rw.WriteHeader(resp.StatusCode)
+	io.Copy(rw, resp.Body)
+
+	return
 }
 
 // buildEnv returns a set of CGI environment variables for the request.
-func (t Transport) buildEnv(r *http.Request) (envVars, error) {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+func (h *Handler) buildEnv(req *http.Request) (envVars, error) {
 
 	var env envVars
 
 	// Separate remote IP and port; more lenient than net.SplitHostPort
 	var ip, port string
-	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx > -1 {
-		ip = r.RemoteAddr[:idx]
-		port = r.RemoteAddr[idx+1:]
+	if idx := strings.LastIndex(req.RemoteAddr, ":"); idx > -1 {
+		ip = req.RemoteAddr[:idx]
+		port = req.RemoteAddr[idx+1:]
 	} else {
-		ip = r.RemoteAddr
+		ip = req.RemoteAddr
 	}
 
 	// Remove [] from IPv6 addresses
@@ -224,25 +212,25 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	ip = strings.Replace(ip, "]", "", 1)
 
 	// make sure file root is absolute
-	root, err := filepath.Abs(repl.ReplaceAll(t.Root, "."))
+	root, err := filepath.Abs(filepath.FromSlash(h.Root))
 	if err != nil {
 		return nil, err
 	}
 
-	if t.ResolveRootSymlink {
+	if h.ResolveRootSymlink {
 		root, err = filepath.EvalSymlinks(root)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	fpath := r.URL.Path
+	fpath := req.URL.Path
 	scriptName := fpath
 
 	docURI := fpath
 	// split "actual path" from "path info" if configured
 	var pathInfo string
-	if splitPos := t.splitPos(fpath); splitPos > -1 {
+	if splitPos := h.splitPos(fpath); splitPos > -1 {
 		docURI = fpath[:splitPos]
 		pathInfo = fpath[splitPos:]
 
@@ -250,15 +238,8 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		scriptName = strings.TrimSuffix(scriptName, pathInfo)
 	}
 
-	// Try to grab the path remainder from a file matcher
-	// if we didn't get a split result here.
-	// See https://github.com/caddyserver/caddy/issues/3718
-	if pathInfo == "" {
-		pathInfo, _ = repl.GetString("http.matchers.file.remainder")
-	}
-
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
-	scriptFilename := caddyhttp.SanitizedPathJoin(root, scriptName)
+	scriptFilename := filepath.Join(h.Root, scriptName)
 
 	// Ensure the SCRIPT_NAME has a leading slash for compliance with RFC3875
 	// Info: https://tools.ietf.org/html/rfc3875#section-4.1.13
@@ -271,47 +252,48 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	// original URI in as the value of REQUEST_URI (the user can overwrite this
 	// if desired). Most PHP apps seem to want the original URI. Besides, this is
 	// how nginx defaults: http://stackoverflow.com/a/12485156/1048862
-	origReq := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
+	// origReq := req.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
 
 	requestScheme := "http"
-	if r.TLS != nil {
+	if req.TLS != nil {
 		requestScheme = "https"
 	}
 
-	reqHost, reqPort, err := net.SplitHostPort(r.Host)
+	reqHost, reqPort, err := net.SplitHostPort(req.Host)
 	if err != nil {
 		// whatever, just assume there was no port
-		reqHost = r.Host
+		reqHost = req.Host
 	}
 
-	authUser, _ := repl.GetString("http.auth.user.id")
+	// authUser, _ := repl.GetString("http.auth.user.id")
+	authUser := ""
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
 	env = envVars{
 		// Variables defined in CGI 1.1 spec
 		"AUTH_TYPE":         "", // Not used
-		"CONTENT_LENGTH":    r.Header.Get("Content-Length"),
-		"CONTENT_TYPE":      r.Header.Get("Content-Type"),
+		"CONTENT_LENGTH":    req.Header.Get("Content-Length"),
+		"CONTENT_TYPE":      req.Header.Get("Content-Type"),
 		"GATEWAY_INTERFACE": "CGI/1.1",
 		"PATH_INFO":         pathInfo,
-		"QUERY_STRING":      r.URL.RawQuery,
+		"QUERY_STRING":      req.URL.RawQuery,
 		"REMOTE_ADDR":       ip,
 		"REMOTE_HOST":       ip, // For speed, remote host lookups disabled
 		"REMOTE_PORT":       port,
 		"REMOTE_IDENT":      "", // Not used
 		"REMOTE_USER":       authUser,
-		"REQUEST_METHOD":    r.Method,
+		"REQUEST_METHOD":    req.Method,
 		"REQUEST_SCHEME":    requestScheme,
 		"SERVER_NAME":       reqHost,
-		"SERVER_PROTOCOL":   r.Proto,
-		"SERVER_SOFTWARE":   t.serverSoftware,
+		"SERVER_PROTOCOL":   req.Proto,
+		"SERVER_SOFTWARE":   h.serverSoftware,
 
 		// Other variables
 		"DOCUMENT_ROOT":   root,
 		"DOCUMENT_URI":    docURI,
-		"HTTP_HOST":       r.Host, // added here, since not always part of headers
-		"REQUEST_URI":     origReq.URL.RequestURI(),
+		"HTTP_HOST":       req.Host, // added here, since not always part of headers
+		"REQUEST_URI":     req.RequestURI,
 		"SCRIPT_FILENAME": scriptFilename,
 		"SCRIPT_NAME":     scriptName,
 	}
@@ -319,9 +301,9 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	// compliance with the CGI specification requires that
 	// PATH_TRANSLATED should only exist if PATH_INFO is defined.
 	// Info: https://www.ietf.org/rfc/rfc3875 Page 14
-	if env["PATH_INFO"] != "" {
-		env["PATH_TRANSLATED"] = caddyhttp.SanitizedPathJoin(root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
-	}
+	// if env["PATH_INFO"] != "" {
+	// 	env["PATH_TRANSLATED"] = caddyhttp.SanitizedPathJoin(root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
+	// }
 
 	// compliance with the CGI specification requires that
 	// the SERVER_PORT variable MUST be set to the TCP/IP port number on which this request is received from the client
@@ -336,30 +318,30 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	}
 
 	// Some web apps rely on knowing HTTPS or not
-	if r.TLS != nil {
+	if req.TLS != nil {
 		env["HTTPS"] = "on"
 		// and pass the protocol details in a manner compatible with apache's mod_ssl
 		// (which is why these have a SSL_ prefix and not TLS_).
-		v, ok := tlsProtocolStrings[r.TLS.Version]
+		v, ok := tlsProtocolStrings[req.TLS.Version]
 		if ok {
 			env["SSL_PROTOCOL"] = v
 		}
 		// and pass the cipher suite in a manner compatible with apache's mod_ssl
-		for _, cs := range caddytls.SupportedCipherSuites() {
-			if cs.ID == r.TLS.CipherSuite {
-				env["SSL_CIPHER"] = cs.Name
-				break
-			}
-		}
+		// for _, cs := range caddytls.SupportedCipherSuites() {
+		// 	if cs.ID == req.TLS.CipherSuite {
+		// 		env["SSL_CIPHER"] = cs.Name
+		// 		break
+		// 	}
+		// }
 	}
 
 	// Add env variables from config (with support for placeholders in values)
-	for key, value := range t.EnvVars {
-		env[key] = repl.ReplaceAll(value, "")
+	for key, value := range h.EnvVars {
+		env[key] = value
 	}
 
 	// Add all HTTP headers to env variables
-	for field, val := range r.Header {
+	for field, val := range req.Header {
 		header := strings.ToUpper(field)
 		header = headerNameReplacer.Replace(header)
 		env["HTTP_"+header] = strings.Join(val, ", ")
@@ -368,18 +350,18 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 }
 
 // splitPos returns the index where path should
-// be split based on t.SplitPath.
-func (t Transport) splitPos(path string) int {
+// be split based on h.SplitPath.
+func (h *Handler) splitPos(path string) int {
 	// TODO: from v1...
 	// if httpserver.CaseSensitivePath {
-	// 	return strings.Index(path, r.SplitPath)
+	// 	return strings.Index(path, req.SplitPath)
 	// }
-	if len(t.SplitPath) == 0 {
+	if len(h.SplitPath) == 0 {
 		return 0
 	}
 
 	lowerPath := strings.ToLower(path)
-	for _, split := range t.SplitPath {
+	for _, split := range h.SplitPath {
 		if idx := strings.Index(lowerPath, strings.ToLower(split)); idx > -1 {
 			return idx + len(split)
 		}
@@ -408,5 +390,5 @@ var headerNameReplacer = strings.NewReplacer(" ", "_", "-", "_")
 
 // Interface guards
 var (
-	_ http.RoundTripper = (*Transport)(nil)
+	_ http.Handler = (*Handler)(nil)
 )
