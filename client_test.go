@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,7 +125,7 @@ func sendFcgi(reqType int, fcgiParams map[string]string, data []byte, posts map[
 		return
 	}
 
-	fcgi := client{rwc: conn, reqID: 1}
+	fcgi := client{rwc: conn, reqID: 1, logger: slog.Default()}
 
 	length := 0
 

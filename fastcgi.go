@@ -28,8 +28,6 @@ import (
 	"time"
 )
 
-var noopLogger = slog.Default()
-
 // Handler facilitates FastCGI communication.
 type Handler struct {
 	// Use this directory as the fastcgi root directory. Defaults to the root
@@ -71,20 +69,24 @@ type Handler struct {
 	// be used instead.
 	CaptureStderr bool `json:"capture_stderr,omitempty"`
 
-	serverSoftware string
-	logger         *slog.Logger
+	ServerSoftware string
+
+	Logger *slog.Logger
 }
 
 // Provision sets up h.
 func (h *Handler) Provision(ctx context.Context) error {
-	h.logger = slog.Default()
-
 	if h.Root == "" {
 		h.Root = "{http.vars.root}"
 	}
 
-	version := "0.1.0"
-	h.serverSoftware = "CaddyFastcgi/" + version
+	if h.ServerSoftware == "" {
+		h.ServerSoftware = "GoFastCGI/1.0.0"
+	}
+
+	if h.Logger == nil {
+		h.Logger = slog.Default()
+	}
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
@@ -118,7 +120,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	loggableEnv := loggableEnv{EnvVars: env, LogCredentials: true}
 
-	logger := h.logger.With(
+	logger := h.Logger.With(
 		"request", req,
 		"env", loggableEnv,
 	)
@@ -287,7 +289,7 @@ func (h *Handler) buildEnv(req *http.Request) (envVars, error) {
 		"REQUEST_SCHEME":    requestScheme,
 		"SERVER_NAME":       reqHost,
 		"SERVER_PROTOCOL":   req.Proto,
-		"SERVER_SOFTWARE":   h.serverSoftware,
+		"SERVER_SOFTWARE":   h.ServerSoftware,
 
 		// Other variables
 		"DOCUMENT_ROOT":   root,

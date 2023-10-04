@@ -235,7 +235,7 @@ func (c *client) Request(p map[string]string, req io.Reader) (resp *http.Respons
 		r:      r.(*streamReader),
 		Reader: rb,
 		status: resp.StatusCode,
-		logger: noopLogger,
+		logger: c.logger,
 	}
 	if chunked(resp.TransferEncoding) {
 		closer.Reader = httputil.NewChunkedReader(rb)
