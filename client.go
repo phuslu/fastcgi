@@ -27,6 +27,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -38,8 +39,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 // FCGIListenSockFileno describes listen socket file number.
@@ -129,7 +128,7 @@ type client struct {
 	// keepAlive bool // TODO: implement
 	reqID  uint16
 	stderr bool
-	logger *zap.Logger
+	logger *slog.Logger
 }
 
 // Do made the request and returns a io.Reader that translates the data read
@@ -175,7 +174,7 @@ type clientCloser struct {
 	io.Reader
 
 	status int
-	logger *zap.Logger
+	logger *slog.Logger
 }
 
 func (f clientCloser) Close() error {
@@ -185,9 +184,9 @@ func (f clientCloser) Close() error {
 	}
 
 	if f.status >= 400 {
-		f.logger.Error("stderr", zap.ByteString("body", stderr))
+		f.logger.Error("stderr", "body", stderr)
 	} else {
-		f.logger.Warn("stderr", zap.ByteString("body", stderr))
+		f.logger.Warn("stderr", "body", stderr)
 	}
 
 	return f.rwc.Close()

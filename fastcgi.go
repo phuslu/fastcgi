@@ -17,6 +17,7 @@ package fastcgi
 import (
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -24,16 +25,13 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
-var noopLogger = zap.NewNop()
+var noopLogger = slog.Default()
 
 func init() {
 	caddy.RegisterModule(Transport{})
@@ -81,7 +79,7 @@ type Transport struct {
 	CaptureStderr bool `json:"capture_stderr,omitempty"`
 
 	serverSoftware string
-	logger         *zap.Logger
+	logger         *slog.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -94,7 +92,7 @@ func (Transport) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up t.
 func (t *Transport) Provision(ctx caddy.Context) error {
-	t.logger = ctx.Logger()
+	t.logger = slog.Default()
 
 	if t.Root == "" {
 		t.Root = "{http.vars.root}"
@@ -142,16 +140,17 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		Request:              r,
 		ShouldLogCredentials: logCreds,
 	}
-	loggableEnv := loggableEnv{vars: env, logCredentials: logCreds}
+	loggableEnv := loggableEnv{EnvVars: env, LogCredentials: logCreds}
 
 	logger := t.logger.With(
-		zap.Object("request", loggableReq),
-		zap.Object("env", loggableEnv),
+		"request", loggableReq,
+		"env", loggableEnv,
 	)
 	logger.Debug("roundtrip",
-		zap.String("dial", address),
-		zap.Object("env", loggableEnv),
-		zap.Object("request", loggableReq))
+		"dial", address,
+		"env", loggableEnv,
+		"request", loggableReq,
+	)
 
 	// connect to the backend
 	dialer := net.Dialer{Timeout: time.Duration(t.DialTimeout)}
@@ -392,21 +391,8 @@ type envVars map[string]string
 
 // loggableEnv is a simple type to allow for speeding up zap log encoding.
 type loggableEnv struct {
-	vars           envVars
-	logCredentials bool
-}
-
-func (env loggableEnv) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	for k, v := range env.vars {
-		if !env.logCredentials {
-			switch strings.ToLower(k) {
-			case "http_cookie", "http_set_cookie", "http_authorization", "http_proxy_authorization":
-				v = ""
-			}
-		}
-		enc.AddString(k, v)
-	}
-	return nil
+	EnvVars        envVars
+	LogCredentials bool
 }
 
 // Map of supported protocols to Apache ssl_mod format
@@ -422,8 +408,5 @@ var headerNameReplacer = strings.NewReplacer(" ", "_", "-", "_")
 
 // Interface guards
 var (
-	_ zapcore.ObjectMarshaler = (*loggableEnv)(nil)
-
-	_ caddy.Provisioner = (*Transport)(nil)
 	_ http.RoundTripper = (*Transport)(nil)
 )
